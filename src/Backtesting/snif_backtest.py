@@ -263,6 +263,7 @@ def run_backtest(
     window_size: int = 30,
     buy_threshold: float = 0.34,
     sell_threshold: float = 0.34,
+    risk_free_rate_annual: float = 0.01,
 ):
     """
     Generate SNIF signals and execute the backtest in Backtrader, then print performance summary.
@@ -304,25 +305,40 @@ def run_backtest(
     cerebro.broker.setcommission(commission)
 
     # Add analyzers
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.01)
+    # Returns: total/avg; TimeReturn: per-period returns for Sharpe; DrawDown: uses nested 'max' dict.
     cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+    cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')  # needed for robust Sharpe
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=risk_free_rate_annual)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
 
     logging.info(f"Running backtest for {ticker}...")
     result = cerebro.run()
     strat = result[0]
+
     sharpe = strat.analyzers.sharpe.get_analysis()
     returns = strat.analyzers.returns.get_analysis()
     drawdown = strat.analyzers.drawdown.get_analysis()
+    timereturns = strat.analyzers.timereturn.get_analysis()  # dict of {datetime: return}
 
     # Summary printing
     print("===== Backtest Summary =====")
+
+    # Sharpe Ratio (fallback to manual if analyzer returns None)
     sharperatio = sharpe.get('sharperatio')
+    if sharperatio is None and timereturns:
+        # Manual Sharpe from daily returns
+        rets = np.array(list(timereturns.values()), dtype=float)
+        if rets.size >= 2 and np.std(rets, ddof=1) > 0:
+            rf_daily = risk_free_rate_annual / 252.0
+            mu_excess = np.mean(rets) - rf_daily
+            sigma = np.std(rets, ddof=1)
+            sharperatio = (mu_excess / sigma) * np.sqrt(252.0)
     if sharperatio is not None:
         print(f"Sharpe Ratio: {sharperatio:.2f}")
     else:
         print("Sharpe Ratio: N/A")
 
+    # Returns
     total_return = returns.get('rtot')
     if total_return is not None:
         print(f"Total Return: {total_return * 100:.2f}%")
@@ -337,12 +353,21 @@ def run_backtest(
     else:
         print("Average Daily Return: N/A")
 
-    md = drawdown.get('maxdrawdown')
-    if md is not None:
-        print(f"Max Drawdown: {md * 100:.2f}%")
+    # Drawdown (correct keys)
+    # Backtrader DrawDown analyzer returns:
+    # {'max': {'drawdown': <pct>, 'moneydown': <amt>, 'len': <bars>}, 'current': {...}}
+    maxdd = None
+    maxdd_len = None
+    if isinstance(drawdown, dict):
+        max_block = drawdown.get('max', {})
+        maxdd = max_block.get('drawdown')
+        maxdd_len = max_block.get('len')
+
+    if maxdd is not None:
+        print(f"Max Drawdown: {maxdd:.2f}%")
     else:
         print("Max Drawdown: N/A")
-    print(f"Max Drawdown Duration: {drawdown.get('maxdrawdownperiod', 'N/A')}")
+    print(f"Max Drawdown Duration (bars): {maxdd_len if maxdd_len is not None else 'N/A'}")
 
     final_value = cerebro.broker.getvalue()
     print(f"Final Portfolio Value: {final_value:.2f}")
@@ -370,6 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--window", type=int, default=30, help="Sliding window size for sequence")
     parser.add_argument("--buy-threshold", type=float, default=0.34, help="Threshold for BUY signal from model probability")
     parser.add_argument("--sell-threshold", type=float, default=0.34, help="Threshold for SELL signal from model probability")
+    parser.add_argument("--rf", type=float, default=0.01, help="Annual risk-free rate for Sharpe ratio (e.g., 0.01 = 1%)")
     args = parser.parse_args()
 
     label_order = _parse_label_order(args.model_labels)
@@ -385,4 +411,5 @@ if __name__ == "__main__":
         window_size=args.window,
         buy_threshold=args.buy_threshold,
         sell_threshold=args.sell_threshold,
+        risk_free_rate_annual=args.rf,
     )
